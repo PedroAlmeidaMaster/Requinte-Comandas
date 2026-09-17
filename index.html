@@ -349,7 +349,12 @@ const MENU = [
   {cat:"Especiais", name:"Café com Nutella", price:15},
   {cat:"Bebidas", name:"Água sem gás", price:4},
   {cat:"Bebidas", name:"Água com gás", price:5},
-  {cat:"Bebidas", name:"Refrigerante lata", price:7},
+  {cat:"Bebidas", name:"Coca Cola lata", price:7},
+  {cat:"Bebidas", name:"Coca Cola Zero lata", price:7},
+  {cat:"Bebidas", name:"Guaraná lata", price:7},
+  {cat:"Bebidas", name:"Guaraná Zero lata", price:7},
+  {cat:"Bebidas", name:"São Geraldo - Cajuína", price:7},
+  {cat:"Bebidas", name:"São Geraldo - Cajuína Zero", price:7},
   {cat:"Bebidas", name:"Chá mate gelado", price:7},
   {cat:"Bebidas", name:"Suco laranja/abacaxi-hortelã", price:12},
   {cat:"Bebidas", name:"Suco cajá/acerola", price:10},
@@ -560,7 +565,11 @@ function renderDetalhe(){
         <div class="li">
           <div>
             <div class="nm">${i.name}</div>
-            <div class="sub">${i.qty} × ${money(i.price)}</div>
+            <div class="stepper" style="margin-top:5px">
+              <button data-decitem="${escapeAttr(i.name)}">−</button>
+              <span class="qty">${i.qty}</span>
+              <button class="add" data-additem="${escapeAttr(i.name)}">+</button>
+            </div>
           </div>
           <div class="val">${money(i.qty*i.price)}</div>
         </div>`).join("") : `<div class="li"><div class="sub">Nenhum item lançado ainda.</div></div>`}
@@ -692,6 +701,17 @@ function attachHandlers(){
       const existing = c.items.find(i=>i.name===menuItem.name);
       if(existing) existing.qty += 1;
       else c.items.push({name:menuItem.name, qty:1, price:menuItem.price});
+      await saveData();
+      render();
+    });
+  });
+  document.querySelectorAll("[data-decitem]").forEach(el=>{
+    el.addEventListener("click", async ()=>{
+      const c = comandas.find(x=>x.id===detalheId);
+      const existing = c.items.find(i=>i.name===el.dataset.decitem);
+      if(!existing) return;
+      if(existing.qty > 1) existing.qty -= 1;
+      else c.items = c.items.filter(i=>i.name!==el.dataset.decitem);
       await saveData();
       render();
     });
