@@ -6,6 +6,7 @@
 <title>Requinte Café · Comandas</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
   :root{
     --red:#7A2331;
@@ -316,6 +317,25 @@
   #confirmOverlay .sheet{
     background:#fff;width:100%;max-width:460px;border-radius:18px 18px 0 0;padding:20px;
   }
+
+  /* caixa: comandas fechadas expansíveis (mesmos tokens visuais já usados) */
+  .caixa-comanda{background:#fff;border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:10px;overflow:hidden;}
+  .caixa-comanda .li{border-bottom:none;}
+  .caixa-comanda .detail{padding:0 15px 14px;border-top:1px solid var(--cream-soft);}
+  .caixa-comanda .detail .meta{font-size:12px;color:var(--ink-soft);margin:10px 0 8px;line-height:1.5;}
+  .caixa-comanda .detail .itens-list{box-shadow:none;border:1px solid var(--cream-soft);margin-bottom:0;}
+  .caixa-comanda .detail .total-line{margin-top:10px;margin-bottom:0;}
+
+  /* relatório: impressão nativa, não afeta a tela normal */
+  #printArea{display:none;}
+  @media print{
+    body > *:not(#printArea){display:none !important;}
+    #printArea{display:block !important;padding:20px;font-family:'Inter',sans-serif;color:#2B2118;}
+    #printArea h2{font-family:'Fraunces',serif;margin-bottom:2px;}
+    #printArea table{width:100%;border-collapse:collapse;margin:8px 0 14px;font-size:12.5px;}
+    #printArea th,#printArea td{text-align:left;padding:4px 6px;border-bottom:1px solid #ddd;}
+    #printArea h3{margin:16px 0 4px;font-size:14px;}
+  }
 </style>
 </head>
 <body>
@@ -336,6 +356,8 @@
 
 <div class="toast" id="toast"></div>
 <div id="confirmOverlay"><div class="sheet" id="confirmSheet"></div></div>
+<div id="printArea"></div>
+
 
 <script>
 /* ================= DADOS DO CARDÁPIO ================= */
@@ -391,6 +413,11 @@ let detalheId = null;
 let detalheCatAtiva = CATS[0];
 let caixaData = new Date().toISOString().slice(0,10);
 let caixaPagamentoFiltro = null;
+let caixaSubView = "diario"; // "diario" | "mensal"
+let caixaExpandidoId = null; // id da comanda fechada expandida na lista
+let caixaMes = new Date().getMonth()+1; // 1-12
+let caixaAno = new Date().getFullYear();
+let relatorioAtivo = null; // { tipo:"diario", data:"YYYY-MM-DD" } ou { tipo:"mensal", mes, ano }
 let loaded = false;
 
 /* ================= STORAGE ================= */
@@ -421,6 +448,32 @@ function cartTotal(){ return Object.entries(novoCart).reduce((s,[n,q])=>{
 },0); }
 function cartCount(){ return Object.values(novoCart).reduce((a,b)=>a+b,0); }
 function minutosAberta(c){ return Math.floor((Date.now() - new Date(c.createdAt).getTime())/60000); }
+function dadosDoDia(dateStr){
+  const fechadas = comandas.filter(c=>c.status==="fechada" && (c.closedAt||"").slice(0,10)===dateStr)
+    .sort((a,b)=>new Date(a.closedAt)-new Date(b.closedAt));
+  const total = fechadas.reduce((s,c)=>s+comandaTotal(c),0);
+  const porPagamento = {};
+  PAYMENTS.forEach(p=>porPagamento[p]=0);
+  fechadas.forEach(c=>{ porPagamento[c.paymentMethod] = (porPagamento[c.paymentMethod]||0) + comandaTotal(c); });
+  return {fechadas, total, porPagamento};
+}
+function dadosDoMes(ano, mes){
+  const prefix = `${ano}-${String(mes).padStart(2,"0")}`;
+  const fechadas = comandas.filter(c=>c.status==="fechada" && (c.closedAt||"").startsWith(prefix));
+  const total = fechadas.reduce((s,c)=>s+comandaTotal(c),0);
+  const porPagamento = {};
+  PAYMENTS.forEach(p=>porPagamento[p]=0);
+  fechadas.forEach(c=>{ porPagamento[c.paymentMethod] = (porPagamento[c.paymentMethod]||0) + comandaTotal(c); });
+  const porDia = {};
+  fechadas.forEach(c=>{
+    const d = c.closedAt.slice(0,10);
+    if(!porDia[d]) porDia[d] = {count:0,total:0};
+    porDia[d].count += 1;
+    porDia[d].total += comandaTotal(c);
+  });
+  const dias = Object.keys(porDia).sort().map(d=>({data:d, count:porDia[d].count, total:porDia[d].total}));
+  return {fechadas, total, porPagamento, dias, ticketMedio: fechadas.length ? total/fechadas.length : 0};
+}
 function showToast(msg){
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -482,6 +535,7 @@ function render(){
   else if(view==="novo") main.innerHTML = renderNovo();
   else if(view==="detalhe") main.innerHTML = renderDetalhe();
   else if(view==="caixa") main.innerHTML = renderCaixa();
+  else if(view==="relatorio") main.innerHTML = renderRelatorio();
   attachHandlers();
 }
 
@@ -600,30 +654,36 @@ function renderDetalhe(){
   `;
 }
 
-/* ================= VIEW: CAIXA (fechamento do dia) ================= */
+/* ================= VIEW: CAIXA (fechamento do dia + relatórios) ================= */
 function renderCaixa(){
-  const fechadasNoDia = comandas.filter(c=>c.status==="fechada" && (c.closedAt||"").slice(0,10)===caixaData);
-  const totalDia = fechadasNoDia.reduce((s,c)=>s+comandaTotal(c),0);
-  const porPagamento = {};
-  PAYMENTS.forEach(p=>porPagamento[p]=0);
-  fechadasNoDia.forEach(c=>{ porPagamento[c.paymentMethod] = (porPagamento[c.paymentMethod]||0) + comandaTotal(c); });
+  const subTabs = `
+    <div class="cat-tabs">
+      <button data-caixasub="diario" class="${caixaSubView==="diario"?'active':''}">Diário</button>
+      <button data-caixasub="mensal" class="${caixaSubView==="mensal"?'active':''}">Mensal</button>
+    </div>`;
 
+  if(caixaSubView==="mensal") return `<h2 class="section-title">Fechamento de caixa</h2>${subTabs}${renderCaixaMensal()}`;
+  return `<h2 class="section-title">Fechamento de caixa</h2>${subTabs}${renderCaixaDiario()}`;
+}
+
+function renderCaixaDiario(){
+  const {fechadas, total, porPagamento} = dadosDoDia(caixaData);
   const listaFiltrada = caixaPagamentoFiltro
-    ? fechadasNoDia.filter(c=>c.paymentMethod===caixaPagamentoFiltro)
-    : fechadasNoDia;
+    ? fechadas.filter(c=>c.paymentMethod===caixaPagamentoFiltro)
+    : fechadas;
 
   return `
-    <h2 class="section-title">Fechamento de caixa</h2>
     <div class="date-picker">
       <button id="diaAnterior">‹</button>
-      <div class="lbl">${fmtDataLabel(caixaData)}</div>
+      <div class="lbl" id="dataLbl" style="cursor:pointer">${fmtDataLabel(caixaData)}</div>
       <button id="diaSeguinte">›</button>
     </div>
+    <input type="date" id="dataInput" value="${caixaData}" style="position:absolute;opacity:0;width:0;height:0;pointer-events:none;">
 
     <div class="resumo-total">
       <div class="lbl">RECEITA TOTAL DO DIA</div>
-      <div class="val">${money(totalDia)}</div>
-      <div class="sub">${fechadasNoDia.length} comanda${fechadasNoDia.length===1?"":"s"} fechada${fechadasNoDia.length===1?"":"s"}</div>
+      <div class="val">${money(total)}</div>
+      <div class="sub">${fechadas.length} comanda${fechadas.length===1?"":"s"} fechada${fechadas.length===1?"":"s"}</div>
     </div>
 
     <label>Por forma de pagamento</label>
@@ -638,16 +698,158 @@ function renderCaixa(){
 
     <label>Comandas fechadas</label>
     ${listaFiltrada.length===0? `<div class="empty" style="padding:24px 10px"><p>Nenhuma comanda fechada nesta data${caixaPagamentoFiltro? " para "+caixaPagamentoFiltro:""}.</p></div>` :
+      listaFiltrada.map(c=>renderCaixaComandaCard(c)).join("")}
+
+    <button class="btn-block btn-secondary" id="gerarRelatorioBtn" style="margin-top:8px">Gerar relatório do dia</button>
+  `;
+}
+
+function renderCaixaComandaCard(c){
+  const aberto = caixaExpandidoId===c.id;
+  const horaFechamento = new Date(c.closedAt).toLocaleTimeString("pt-BR",{hour:'2-digit',minute:'2-digit'});
+  const horaAbertura = new Date(c.createdAt).toLocaleTimeString("pt-BR",{hour:'2-digit',minute:'2-digit'});
+  return `
+    <div class="caixa-comanda">
+      <div class="li" data-toggleclosed="${c.id}" style="cursor:pointer">
+        <div>
+          <div class="nm">${escapeHtml(c.cliente)} <span style="color:var(--ink-soft);font-weight:400">${aberto?'▾':'▸'}</span></div>
+          <div class="sub">Fechada às ${horaFechamento} · ${c.paymentMethod}</div>
+        </div>
+        <div class="val">${money(comandaTotal(c))}</div>
+      </div>
+      ${aberto? `
+      <div class="detail">
+        <div class="meta">Abertura: ${horaAbertura} &nbsp;·&nbsp; Fechamento: ${horaFechamento}<br>Pagamento: ${c.paymentMethod}</div>
+        <div class="itens-list">
+          ${c.items.map(i=>`
+            <div class="li">
+              <div><div class="nm">${i.name}</div><div class="sub">${i.qty} × ${money(i.price)}</div></div>
+              <div class="val">${money(i.qty*i.price)}</div>
+            </div>`).join("")}
+        </div>
+        <div class="total-line"><div class="lbl">Total</div><div class="val">${money(comandaTotal(c))}</div></div>
+      </div>` : ""}
+    </div>`;
+}
+
+function renderCaixaMensal(){
+  const {fechadas, total, porPagamento, dias, ticketMedio} = dadosDoMes(caixaAno, caixaMes);
+  const labelMes = new Date(caixaAno, caixaMes-1, 1).toLocaleDateString("pt-BR",{month:"long", year:"numeric"});
+  return `
+    <div class="date-picker">
+      <button id="mesAnterior">‹</button>
+      <div class="lbl" style="text-transform:capitalize">${labelMes}</div>
+      <button id="mesSeguinte">›</button>
+    </div>
+
+    <div class="resumo-total">
+      <div class="lbl">FATURAMENTO DO MÊS</div>
+      <div class="val">${money(total)}</div>
+      <div class="sub">${fechadas.length} comanda${fechadas.length===1?"":"s"} fechada${fechadas.length===1?"":"s"} · ticket médio ${money(ticketMedio)}</div>
+    </div>
+
+    <label>Por forma de pagamento</label>
+    <div class="pay-summary">
+      ${PAYMENTS.map(p=>`
+        <div class="pl">
+          <div class="nm">${p}</div>
+          <div class="vl">${money(porPagamento[p]||0)}</div>
+        </div>`).join("")}
+    </div>
+
+    <label>Movimento por dia</label>
+    ${dias.length===0? `<div class="empty" style="padding:24px 10px"><p>Nenhuma comanda fechada neste mês.</p></div>` :
     `<div class="itens-list">
-      ${listaFiltrada.sort((a,b)=>new Date(a.closedAt)-new Date(b.closedAt)).map(c=>`
+      ${dias.map(d=>`
         <div class="li">
-          <div>
-            <div class="nm">${escapeHtml(c.cliente)}</div>
-            <div class="sub">${c.paymentMethod} · ${new Date(c.closedAt).toLocaleTimeString("pt-BR",{hour:'2-digit',minute:'2-digit'})}</div>
-          </div>
+          <div><div class="nm">${new Date(d.data+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit'})}</div><div class="sub">${d.count} comanda${d.count===1?"":"s"}</div></div>
+          <div class="val">${money(d.total)}</div>
+        </div>`).join("")}
+    </div>`}
+
+    <button class="btn-block btn-secondary" id="gerarRelatorioMensalBtn" style="margin-top:8px">Gerar relatório do mês</button>
+  `;
+}
+
+/* ================= VIEW: VISUALIZAÇÃO DO RELATÓRIO (tela intermediária, antes de imprimir) ================= */
+function renderRelatorio(){
+  if(!relatorioAtivo){ view="caixa"; return renderCaixa(); }
+  return relatorioAtivo.tipo==="mensal"
+    ? renderRelatorioMensal(relatorioAtivo.ano, relatorioAtivo.mes)
+    : renderRelatorioDiario(relatorioAtivo.data);
+}
+
+function renderRelatorioDiario(dateStr){
+  const {fechadas, total, porPagamento} = dadosDoDia(dateStr);
+  const dataFmt = new Date(dateStr+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit',year:'numeric'});
+  return `
+    <button class="backbtn" id="voltarCaixaBtn">← Voltar para o Caixa</button>
+    <div class="detail-head" style="text-align:center">
+      <div class="cliente" style="font-size:16px">REQUINTE CAFÉ</div>
+      <div class="meta" style="margin-top:4px">FECHAMENTO DE CAIXA<br>${dataFmt}</div>
+    </div>
+
+    <label>Movimentação do dia</label>
+    ${fechadas.length===0? `<div class="empty" style="padding:20px 10px"><p>Nenhuma comanda fechada no período.</p></div>` :
+    `<div class="itens-list">
+      ${fechadas.map(c=>`
+        <div class="li">
+          <div><div class="nm">${escapeHtml(c.cliente)}</div><div class="sub">${c.paymentMethod}</div></div>
           <div class="val">${money(comandaTotal(c))}</div>
         </div>`).join("")}
     </div>`}
+
+    <label>Resumo do caixa</label>
+    <div class="pay-summary">
+      ${PAYMENTS.map(p=>`
+        <div class="pl">
+          <div class="nm">${p}</div>
+          <div class="vl">${money(porPagamento[p]||0)}</div>
+        </div>`).join("")}
+    </div>
+
+    <div class="total-line" style="margin-top:4px"><div class="lbl">Receita total</div><div class="val">${money(total)}</div></div>
+
+    <button class="btn-block btn-primary" id="imprimirRelatorioBtn" style="margin-top:8px">Imprimir / Salvar PDF</button>
+  `;
+}
+
+function renderRelatorioMensal(ano, mes){
+  const {fechadas, total, porPagamento, dias, ticketMedio} = dadosDoMes(ano, mes);
+  const labelMes = new Date(ano, mes-1, 1).toLocaleDateString("pt-BR",{month:"long", year:"numeric"});
+  return `
+    <button class="backbtn" id="voltarCaixaBtn">← Voltar para o Caixa</button>
+    <div class="detail-head" style="text-align:center">
+      <div class="cliente" style="font-size:16px">REQUINTE CAFÉ</div>
+      <div class="meta" style="margin-top:4px;text-transform:capitalize">FECHAMENTO DE CAIXA<br>${labelMes}</div>
+    </div>
+
+    <label>Resumo do caixa</label>
+    <div class="pay-summary">
+      ${PAYMENTS.map(p=>`
+        <div class="pl">
+          <div class="nm">${p}</div>
+          <div class="vl">${money(porPagamento[p]||0)}</div>
+        </div>`).join("")}
+    </div>
+
+    <div class="total-line" style="margin-top:4px"><div class="lbl">Receita total do mês</div><div class="val">${money(total)}</div></div>
+    <div class="pay-summary" style="margin-top:10px">
+      <div class="pl"><div class="nm">Quantidade de comandas fechadas</div><div class="vl">${fechadas.length}</div></div>
+      <div class="pl"><div class="nm">Ticket médio</div><div class="vl">${money(ticketMedio)}</div></div>
+    </div>
+
+    <label>Movimento por dia</label>
+    ${dias.length===0? `<div class="empty" style="padding:24px 10px"><p>Nenhuma comanda fechada neste mês.</p></div>` :
+    `<div class="itens-list">
+      ${dias.map(d=>`
+        <div class="li">
+          <div><div class="nm">${new Date(d.data+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit'})}</div><div class="sub">${d.count} comanda${d.count===1?"":"s"}</div></div>
+          <div class="val">${money(d.total)}</div>
+        </div>`).join("")}
+    </div>`}
+
+    <button class="btn-block btn-primary" id="imprimirRelatorioBtn" style="margin-top:8px">Imprimir / Salvar PDF</button>
   `;
 }
 
@@ -732,10 +934,17 @@ function attachHandlers(){
   });
 
   // ---- CAIXA ----
+  document.querySelectorAll("[data-caixasub]").forEach(el=>{
+    el.addEventListener("click", ()=>{ caixaSubView = el.dataset.caixasub; caixaExpandidoId=null; render(); });
+  });
   const prev = document.getElementById("diaAnterior");
   const next = document.getElementById("diaSeguinte");
-  if(prev) prev.addEventListener("click", ()=>{ caixaData = new Date(new Date(caixaData+"T12:00:00").getTime()-86400000).toISOString().slice(0,10); caixaPagamentoFiltro=null; render(); });
-  if(next) next.addEventListener("click", ()=>{ caixaData = new Date(new Date(caixaData+"T12:00:00").getTime()+86400000).toISOString().slice(0,10); caixaPagamentoFiltro=null; render(); });
+  if(prev) prev.addEventListener("click", ()=>{ caixaData = new Date(new Date(caixaData+"T12:00:00").getTime()-86400000).toISOString().slice(0,10); caixaPagamentoFiltro=null; caixaExpandidoId=null; render(); });
+  if(next) next.addEventListener("click", ()=>{ caixaData = new Date(new Date(caixaData+"T12:00:00").getTime()+86400000).toISOString().slice(0,10); caixaPagamentoFiltro=null; caixaExpandidoId=null; render(); });
+  const dataLbl = document.getElementById("dataLbl");
+  const dataInput = document.getElementById("dataInput");
+  if(dataLbl && dataInput) dataLbl.addEventListener("click", ()=>{ if(dataInput.showPicker) dataInput.showPicker(); else dataInput.click(); });
+  if(dataInput) dataInput.addEventListener("change", (e)=>{ if(e.target.value){ caixaData = e.target.value; caixaPagamentoFiltro=null; caixaExpandidoId=null; render(); } });
   document.querySelectorAll("[data-filterpay]").forEach(el=>{
     el.addEventListener("click", ()=>{
       const p = el.dataset.filterpay;
@@ -745,6 +954,208 @@ function attachHandlers(){
   });
   const limparFiltro = document.getElementById("limparFiltroPay");
   if(limparFiltro) limparFiltro.addEventListener("click", ()=>{ caixaPagamentoFiltro=null; render(); });
+  document.querySelectorAll("[data-toggleclosed]").forEach(el=>{
+    el.addEventListener("click", ()=>{
+      const id = el.dataset.toggleclosed;
+      caixaExpandidoId = (caixaExpandidoId===id) ? null : id;
+      render();
+    });
+  });
+  const gerarRelatorioBtn = document.getElementById("gerarRelatorioBtn");
+  if(gerarRelatorioBtn) gerarRelatorioBtn.addEventListener("click", ()=>{
+    relatorioAtivo = {tipo:"diario", data:caixaData};
+    view = "relatorio";
+    render();
+  });
+  const mesAnterior = document.getElementById("mesAnterior");
+  const mesSeguinte = document.getElementById("mesSeguinte");
+  if(mesAnterior) mesAnterior.addEventListener("click", ()=>{ caixaMes -= 1; if(caixaMes<1){ caixaMes=12; caixaAno-=1; } render(); });
+  if(mesSeguinte) mesSeguinte.addEventListener("click", ()=>{ caixaMes += 1; if(caixaMes>12){ caixaMes=1; caixaAno+=1; } render(); });
+  const gerarRelatorioMensalBtn = document.getElementById("gerarRelatorioMensalBtn");
+  if(gerarRelatorioMensalBtn) gerarRelatorioMensalBtn.addEventListener("click", ()=>{
+    relatorioAtivo = {tipo:"mensal", mes:caixaMes, ano:caixaAno};
+    view = "relatorio";
+    render();
+  });
+
+  // ---- RELATÓRIO (visualização, separado da impressão) ----
+  const voltarCaixaBtn = document.getElementById("voltarCaixaBtn");
+  if(voltarCaixaBtn) voltarCaixaBtn.addEventListener("click", ()=>{
+    relatorioAtivo = null;
+    view = "caixa";
+    render();
+  });
+  const imprimirRelatorioBtn = document.getElementById("imprimirRelatorioBtn");
+  if(imprimirRelatorioBtn) imprimirRelatorioBtn.addEventListener("click", ()=>{ imprimirRelatorioAtivo(); });
+}
+
+/* ================= IMPRESSÃO (somente ao clicar em "Imprimir / Salvar PDF") ================= */
+function construirRelatorioDiarioImpressao(dateStr){
+  const {fechadas, total, porPagamento} = dadosDoDia(dateStr);
+  const dataFmt = new Date(dateStr+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit',year:'numeric'});
+  const resumoPagHtml = PAYMENTS.map(p=>`<tr><td>${p}</td><td>${money(porPagamento[p]||0)}</td></tr>`).join("");
+  const movimentacaoHtml = fechadas.length===0 ? "<p>Nenhuma comanda fechada no período.</p>" : `
+    <table>
+      <tr><th>Cliente</th><th>Valor</th><th>Forma de Pagamento</th></tr>
+      ${fechadas.map(c=>`<tr><td>${escapeHtml(c.cliente)}</td><td>${money(comandaTotal(c))}</td><td>${c.paymentMethod}</td></tr>`).join("")}
+    </table>`;
+
+  return `
+    <h2>Requinte Café</h2>
+    <p><strong>Fechamento de Caixa</strong><br>${dataFmt}</p>
+    <h3>Movimentação do dia</h3>
+    ${movimentacaoHtml}
+    <h3>Resumo do caixa</h3>
+    <table><tr><th>Forma de Pagamento</th><th>Receita Recebida</th></tr>${resumoPagHtml}</table>
+    <p><strong>Receita total: ${money(total)}</strong></p>
+  `;
+}
+
+function construirRelatorioMensalImpressao(ano, mes){
+  const {fechadas, total, porPagamento, dias, ticketMedio} = dadosDoMes(ano, mes);
+  const labelMes = new Date(ano, mes-1, 1).toLocaleDateString("pt-BR",{month:"long", year:"numeric"});
+  const resumoPagHtml = PAYMENTS.map(p=>`<tr><td>${p}</td><td>${money(porPagamento[p]||0)}</td></tr>`).join("");
+  const diasHtml = dias.length===0 ? "<p>Nenhuma comanda fechada no período.</p>" : `
+    <table>
+      <tr><th>Data</th><th>Quantidade de Comandas</th><th>Receita</th></tr>
+      ${dias.map(d=>`<tr><td>${new Date(d.data+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit'})}</td><td>${d.count}</td><td>${money(d.total)}</td></tr>`).join("")}
+    </table>`;
+
+  return `
+    <h2>Requinte Café</h2>
+    <p><strong>Fechamento de Caixa</strong><br>${labelMes}</p>
+    <h3>Resumo do caixa</h3>
+    <table><tr><th>Forma de Pagamento</th><th>Receita Recebida</th></tr>${resumoPagHtml}</table>
+    <p><strong>Receita total do mês: ${money(total)}</strong></p>
+    <p>Quantidade de comandas fechadas: ${fechadas.length}</p>
+    <p>Ticket médio: ${money(ticketMedio)}</p>
+    <h3>Movimento por dia</h3>
+    ${diasHtml}
+  `;
+}
+
+function imprimirRelatorioAtivo(){
+  if(!relatorioAtivo) return;
+  if(relatorioAtivo.tipo==="mensal") gerarPdfMensal(relatorioAtivo.ano, relatorioAtivo.mes);
+  else gerarPdfDiario(relatorioAtivo.data);
+}
+
+/* ================= GERAÇÃO DE PDF REAL (jsPDF) ================= */
+function pdfDisponivel(){
+  if(!(window.jspdf && window.jspdf.jsPDF)){
+    showToast("Não foi possível carregar o gerador de PDF. Verifique sua conexão e tente novamente.");
+    return false;
+  }
+  return true;
+}
+function novoDocPDF(){
+  const { jsPDF } = window.jspdf;
+  return new jsPDF({ unit:"pt", format:"a4" });
+}
+function pdfCabecalho(doc, linhaPeriodo){
+  doc.setFont("helvetica","bold");
+  doc.setFontSize(16);
+  doc.text("REQUINTE CAFÉ", 40, 50);
+  doc.setFontSize(12);
+  doc.text("FECHAMENTO DE CAIXA", 40, 68);
+  doc.setFont("helvetica","normal");
+  doc.setFontSize(10);
+  doc.text(linhaPeriodo, 40, 84);
+  doc.setLineWidth(0.75);
+  doc.line(40, 94, 555, 94);
+  return 116;
+}
+function pdfQuebraPagina(doc, y){
+  if(y > 780){ doc.addPage(); return 50; }
+  return y;
+}
+function pdfResumoPagamento(doc, y, porPagamento){
+  doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  doc.text("Resumo por forma de pagamento", 40, y); y += 18;
+  doc.setFont("helvetica","normal"); doc.setFontSize(10);
+  PAYMENTS.forEach(p=>{
+    y = pdfQuebraPagina(doc, y);
+    doc.text(p, 40, y);
+    doc.text(money(porPagamento[p]||0), 515, y, {align:"right"});
+    y += 15;
+  });
+  return y + 10;
+}
+
+function gerarPdfDiario(dateStr){
+  if(!pdfDisponivel()) return;
+  const {fechadas, total, porPagamento} = dadosDoDia(dateStr);
+  const dataFmt = new Date(dateStr+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit',year:'numeric'});
+  const doc = novoDocPDF();
+  let y = pdfCabecalho(doc, "Data: "+dataFmt);
+
+  doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  doc.text("Quantidade de comandas fechadas: "+fechadas.length, 40, y); y += 16;
+  doc.text("Faturamento total: "+money(total), 40, y); y += 24;
+
+  y = pdfResumoPagamento(doc, y, porPagamento);
+
+  doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  y = pdfQuebraPagina(doc, y);
+  doc.text("Movimentação do dia", 40, y); y += 18;
+  doc.setFontSize(10);
+  y = pdfQuebraPagina(doc, y);
+  doc.text("Cliente", 40, y); doc.text("Valor", 340, y); doc.text("Forma de Pagamento", 420, y);
+  y += 6; doc.line(40, y, 555, y); y += 14;
+  doc.setFont("helvetica","normal");
+  if(fechadas.length===0){
+    doc.text("Nenhuma comanda fechada no período.", 40, y); y += 16;
+  } else {
+    fechadas.forEach(c=>{
+      y = pdfQuebraPagina(doc, y);
+      doc.text(String(c.cliente).slice(0,42), 40, y);
+      doc.text(money(comandaTotal(c)), 340, y);
+      doc.text(String(c.paymentMethod), 420, y);
+      y += 15;
+    });
+  }
+
+  const nomeArquivo = "Requinte_Cafe_Fechamento_Caixa_" + dateStr.split("-").reverse().join("-") + ".pdf";
+  doc.save(nomeArquivo);
+}
+
+function gerarPdfMensal(ano, mes){
+  if(!pdfDisponivel()) return;
+  const {fechadas, total, porPagamento, dias, ticketMedio} = dadosDoMes(ano, mes);
+  const labelMesRaw = new Date(ano, mes-1, 1).toLocaleDateString("pt-BR",{month:"long", year:"numeric"});
+  const labelMes = labelMesRaw.charAt(0).toUpperCase()+labelMesRaw.slice(1);
+  const doc = novoDocPDF();
+  let y = pdfCabecalho(doc, labelMes);
+
+  doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  doc.text("Quantidade de comandas fechadas: "+fechadas.length, 40, y); y += 16;
+  doc.text("Faturamento total: "+money(total), 40, y); y += 16;
+  doc.text("Ticket médio: "+money(ticketMedio), 40, y); y += 24;
+
+  y = pdfResumoPagamento(doc, y, porPagamento);
+
+  doc.setFont("helvetica","bold"); doc.setFontSize(11);
+  y = pdfQuebraPagina(doc, y);
+  doc.text("Movimento por dia", 40, y); y += 18;
+  doc.setFontSize(10);
+  y = pdfQuebraPagina(doc, y);
+  doc.text("Data", 40, y); doc.text("Qtd. comandas", 220, y); doc.text("Faturamento", 400, y);
+  y += 6; doc.line(40, y, 555, y); y += 14;
+  doc.setFont("helvetica","normal");
+  if(dias.length===0){
+    doc.text("Nenhuma comanda fechada no período.", 40, y); y += 16;
+  } else {
+    dias.forEach(d=>{
+      y = pdfQuebraPagina(doc, y);
+      doc.text(new Date(d.data+"T12:00:00").toLocaleDateString("pt-BR",{day:'2-digit',month:'2-digit'}), 40, y);
+      doc.text(String(d.count), 220, y);
+      doc.text(money(d.total), 400, y);
+      y += 15;
+    });
+  }
+
+  const nomeArquivo = "Requinte_Cafe_Fechamento_Caixa_" + String(mes).padStart(2,"0") + "-" + ano + ".pdf";
+  doc.save(nomeArquivo);
 }
 
 function refreshCartBar(){
